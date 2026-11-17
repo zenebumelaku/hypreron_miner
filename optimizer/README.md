@@ -23,6 +23,7 @@ Example:
 python3 optimizer/prototype.py \
   --dataset experiments/data/very-small-ugly.metta \
   --petta /path/to/PeTTa/run.sh \
+  --petta-venv /path/to/python3.11-venv \
   --trials 4 \
   --output optimizer-report.json
 ```
@@ -34,6 +35,7 @@ configuration file:
 python3 optimizer/prototype.py \
   --dataset experiments/data/very-small-ugly.metta \
   --petta /path/to/PeTTa/run.sh \
+  --petta-venv /path/to/python3.11-venv \
   --config-file optimizer/manual-baseline.json \
   --output manual-report.json
 ```
@@ -42,3 +44,27 @@ The JSON report contains the dataset profile, proposed configurations, measured
 results, statuses (`ok`, `invalid`, `failed`, or `timeout`), memory estimate,
 pattern counts, support values, surprisingness values, and the selected run.
 
+PeTTa uses SWI-Prolog Janus, whose embedded Python version must match the venv
+layout it receives. On this macOS setup Janus uses Python 3.11, so use a Python
+3.11 venv for `--petta-venv` rather than the project’s Python 3.15 venv.
+
+Run the local harness tests with:
+
+```bash
+python3 -m unittest discover -s optimizer -p 'test_*.py' -v
+```
+
+The prototype has been smoke-tested against PeTTa using the checked-in sample
+dataset. A two-configuration report can be reproduced with:
+
+```bash
+python3 optimizer/prototype.py \
+  --repo . \
+  --dataset experiments/data/very-small-ugly.metta \
+  --petta /path/to/PeTTa/run.sh \
+  --petta-venv /path/to/python3.11-venv \
+  --config-file optimizer/quick-experiment.json \
+  --trials 2 \
+  --timeout 60 \
+  --output optimizer/quick-experiment-report.json
+```

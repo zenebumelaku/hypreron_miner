@@ -22,6 +22,27 @@ from pathlib import Path
 from typing import Any
 
 
+MINIMAL_FREQUENT_IMPORTS = (
+    "experiments/utils/common-utils",
+    "experiments/utils/index_to_var",
+    "experiments/utils/constants",
+    "experiments/utils/TruthValue",
+    "experiments/utils/sort",
+    "experiments/utils/variable-combinations",
+    "experiments/utils/remove_useless_clauses",
+    "experiments/utils/surp-utils/blk-abstractness",
+    "experiments/frequent-pattern-miner/valuation",
+    "experiments/frequent-pattern-miner/shallow-abstractions",
+    "experiments/frequent-pattern-miner/specialization",
+    "experiments/frequent-pattern-miner/candidate",
+    "experiments/frequent-pattern-miner/conjunction-expansion",
+    "experiments/frequent-pattern-miner/frequent-pattern-miner-generic",
+    "experiments/pattern-miner/pattern-miner",
+)
+RESULT_BEGIN = "OPTIMIZER_RESULTS_BEGIN"
+RESULT_END = "OPTIMIZER_RESULTS_END"
+
+
 @dataclass(frozen=True)
 class Config:
     min_support: int
@@ -123,6 +144,13 @@ def _text(value: str | bytes | None) -> str:
 
 def make_script(repo: Path, dataset: Path, config: Config) -> Path:
     template = (repo / "run_miner.metta").read_text(encoding="utf-8")
+    if config.mode == "none":
+        body_lines = [
+            line for line in template.splitlines()
+            if not re.fullmatch(r"!\(import! &self [^)]+\)", line.strip())
+        ]
+        imports = [f"!(import! &self {module})" for module in MINIMAL_FREQUENT_IMPORTS]
+        template = "\n".join(imports + body_lines) + "\n"
     dataset_expr = dataset.resolve().as_posix()
     template = re.sub(r"!\(import! &db [^\n]+\)",
                       f"!(import! &db {dataset_expr})", template, count=1)
@@ -131,6 +159,12 @@ def make_script(repo: Path, dataset: Path, config: Config) -> Path:
             f"{config.mode} {_metta_value(config.normalization)} "
             f"{config.db_ratio} {_metta_value(config.conj_exp)})")
     template = re.sub(r"!\(pattern-miner &res &db[^\n]+\)", call, template, count=1)
+    template = template.replace(
+        "!(get-atoms &res)",
+        f"!(println! \"{RESULT_BEGIN}\")\n"
+        f"!(get-atoms &res)\n!(println! \"{RESULT_END}\")",
+        1,
+    )
     handle = tempfile.NamedTemporaryFile("w", suffix=".metta", prefix=".optimizer-",
                                          dir=repo, delete=False, encoding="utf-8")
     handle.write(template)
@@ -138,7 +172,13 @@ def make_script(repo: Path, dataset: Path, config: Config) -> Path:
     return Path(handle.name)
 
 
-def parse_results(output: str) -> tuple[int, list[float], list[float]]:
+def parse_results(output: str, result_section_only: bool = False) -> tuple[int, list[float], list[float]]:
+    if result_section_only:
+        if RESULT_BEGIN not in output:
+            return 0, [], []
+        # PeTTa may flush get-atoms results after the end marker. The begin
+        # marker is the reliable boundary after all translated source output.
+        output = output.split(RESULT_BEGIN, 1)[1]
     support = [float(x) for x in re.findall(r"supportOf[\s\S]*?\s([0-9]+(?:\.[0-9]+)?)\)?", output)]
     surprise = [float(x) for x in re.findall(
         r"surprisingnessOf[\s\S]*?\s([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?\d+)?)\)?", output)]
@@ -148,7 +188,8 @@ def parse_results(output: str) -> tuple[int, list[float], list[float]]:
     return count, support, surprise
 
 
-def run_miner(repo: Path, petta: str, dataset: Path, config: Config, timeout: int) -> RunResult:
+def run_miner(repo: Path, petta: str, dataset: Path, config: Config,
+              timeout: int, petta_venv: Path | None = None) -> RunResult:
     errors = validate_config(config, analyze_dataset(dataset))
     if errors:
         return RunResult(asdict(config), "invalid", 0.0, None, 0, [], [], "", "", "; ".join(errors))
@@ -156,14 +197,17 @@ def run_miner(repo: Path, petta: str, dataset: Path, config: Config, timeout: in
     command = ["sh", petta] if petta.endswith(".sh") else [petta]
     started = time.perf_counter()
     before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    environment = os.environ.copy()
+    if petta_venv:
+        environment["VIRTUAL_ENV"] = str(petta_venv.resolve())
     try:
-        proc = subprocess.run(command + [str(script)], cwd=repo, capture_output=True,
-                              text=True, timeout=timeout)
+        proc = subprocess.run(command + [str(script)], cwd=repo, env=environment,
+                              capture_output=True, text=True, timeout=timeout)
         elapsed = time.perf_counter() - started
         after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
         # macOS reports bytes; Linux reports KiB.
         multiplier = 1 / (1024 * 1024) if os.uname().sysname == "Darwin" else 1 / 1024
-        count, support, surprise = parse_results(proc.stdout + "\n" + proc.stderr)
+        count, support, surprise = parse_results(proc.stdout + "\n" + proc.stderr, True)
         return RunResult(asdict(config), "ok" if proc.returncode == 0 else "failed",
                          elapsed, max(0.0, after - before) * multiplier, count,
                          support, surprise, proc.stdout, proc.stderr,
@@ -230,6 +274,8 @@ def main() -> int:
     parser.add_argument("--repo", type=Path, default=Path(__file__).parents[1])
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--petta", default=os.environ.get("PETTA", "petta"))
+    parser.add_argument("--petta-venv", type=Path,
+                        help="Python 3.11 venv used by SWI-Prolog Janus")
     parser.add_argument("--trials", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--max-seconds", type=float)
@@ -246,7 +292,8 @@ def main() -> int:
         llm = {"provider": "manual-config-file", "path": str(args.config_file.resolve())}
     else:
         configs, llm = llm_candidates(profile, [], args.trials)
-    results = [run_miner(repo, args.petta, dataset, config, args.timeout) for config in configs]
+    results = [run_miner(repo, args.petta, dataset, config, args.timeout, args.petta_venv)
+               for config in configs]
     best = select_best(results, args.max_seconds, args.min_patterns)
     report = {"dataset": asdict(profile), "llm": llm, "results": [asdict(r) for r in results],
               "best": asdict(best) if best else None,
